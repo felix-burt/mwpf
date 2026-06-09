@@ -3,7 +3,7 @@ requires = ["maturin>=1.7,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "mwpf"
+name = "mwpf-dev"
 description = "Minimum-Weight Parity Factor (MWPF) decoder for QEC"
 readme = "README.md"
 license = "MIT"
@@ -37,6 +37,7 @@ stim = ["frozendict", "frozenlist", "numpy", "stim>=1.14.0", "sinter>=1.14.0"]
 
 [tool.maturin]
 no-default-features = true
+module-name = "mwpf_dev.mwpf"
 features = [
     "python_binding",
     "f64_weight",
@@ -50,7 +51,7 @@ python-source = "src/python"
 
 [[tool.mypy.overrides]]
 allow_redefinition = true
-module = ["mwpf.*", "stim.*", "sinter.*", "mwpf_rational.*", "tqdm.*"]
+module = ["mwpf_dev.*", "stim.*", "sinter.*", "mwpf_rational.*", "tqdm.*"]
 follow_untyped_imports = true
 ignore_missing_imports = true
 implicit_reexport = true

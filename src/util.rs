@@ -338,6 +338,7 @@ impl SolverInitializer {
         let kwargs = PyDict::new(py);
         kwargs.set_item("vertex_num", self.vertex_num)?;
         kwargs.set_item("weighted_edges", self.weighted_edges.clone())?;
+        kwargs.set_item("heralds", self.get_heralds())?;
         let args = PyTuple::empty(py);
         Ok((args, kwargs).into_pyobject(py)?.unbind())
     }

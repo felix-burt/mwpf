@@ -17,7 +17,6 @@ try:
         )
         from . import pymatching_decoders
     except ImportError:
-        # pymatching is an optional dependency
         pass
 except BaseException as e:
     raise e

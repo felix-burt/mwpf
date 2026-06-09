@@ -32,11 +32,37 @@ import stim
 from dataclasses import dataclass, field
 from typing import Iterator, Iterable, TypeAlias, Collection, Protocol, Sequence, Any
 import functools
+import contextlib
 import numpy as np
 from functools import reduce
 from frozendict import frozendict
 from frozenlist import FrozenList
 from . import mwpf
+
+
+# When True, RefCircuit.__post_init__ skips the (expensive) sanity_check.
+# Toggled via the `unchecked_ref_circuit` context manager. This is intended
+# for trusted internal callers that synthesise RefCircuit instances from
+# already-validated parts (e.g. HeraldedDetectorErrorModel.heralded_dems).
+_skip_sanity_check: bool = False
+
+
+@contextlib.contextmanager
+def unchecked_ref_circuit() -> Iterator[None]:
+    """Disable RefCircuit.sanity_check inside the with-block.
+
+    sanity_check rebuilds the full stim.Circuit (via cached
+    `stim_instructions`) just to assert num_measurements consistency, which
+    is the dominant cost when constructing many small RefCircuit variants
+    in a tight loop. Skip it when the inputs are known to be well-formed.
+    """
+    global _skip_sanity_check
+    prev = _skip_sanity_check
+    _skip_sanity_check = True
+    try:
+        yield
+    finally:
+        _skip_sanity_check = prev
 
 
 @dataclass(frozen=True)
@@ -145,7 +171,8 @@ class RefCircuit:
     instructions: tuple[RefInstruction, ...]
 
     def __post_init__(self):
-        self.sanity_check()
+        if not _skip_sanity_check:
+            self.sanity_check()
 
     @staticmethod
     def of(

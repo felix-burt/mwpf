@@ -20,37 +20,30 @@ from .ref_circuit import (
     RefDetector,
     RefDetectorErrorModel,
     RefDemInstruction,
+    is_noise_channel_instruction,
     probability_to_weight,
     Predictor,
+    unchecked_ref_circuit,
 )
 from typing import Sequence
 import functools
 from dataclasses import dataclass
+from collections import defaultdict
 from frozendict import frozendict
 from . import mwpf
 import numpy as np
 
 
-DEM_MIN_PROBABILITY = 1e-15  # below this value, DEM starts to ignore the error rate
+# Tag prefix used to mark herald-derived noise instructions in the unified
+# circuit; the suffix is the (decimal) detector id of the herald. The DEM
+# compiler propagates `tag` from each circuit instruction onto every error
+# mechanism it produces, so we can attribute DEM errors back to heralds in
+# pure C++ time. Must be unique enough not to clash with any user-supplied
+# tag on noise channels in the input circuit.
+_HERALD_TAG_PREFIX = "_mwpf_herald_"
 
-# Stim noise instructions filtered out when building a deterministic Pauli-propagation
-# probe in HeraldedDetectorErrorModel.heralded_dems.  Anything that can randomly flip
-# a qubit must be excluded so that a single sample gives a deterministic flip set.
-_NOISE_INSTRUCTION_NAMES = frozenset(
-    {
-        "X_ERROR",
-        "Y_ERROR",
-        "Z_ERROR",
-        "DEPOLARIZE1",
-        "DEPOLARIZE2",
-        "PAULI_CHANNEL_1",
-        "PAULI_CHANNEL_2",
-        "HERALDED_ERASE",
-        "HERALDED_PAULI_CHANNEL_1",
-        "CORRELATED_ERROR",
-        "ELSE_CORRELATED_ERROR",
-    }
-)
+
+DEM_MIN_PROBABILITY = 1e-15  # below this value, DEM starts to ignore the error rate
 
 
 # avoid non-zero small probability to be ignored by the DEM
@@ -80,6 +73,7 @@ class HeraldedDetectorErrorModel:
 
     def sanity_check(self) -> None:
         # check basic type
+
         assert isinstance(
             self.ref_circuit, RefCircuit
         ), "ref_circuit must be a RefCircuit"
@@ -213,159 +207,127 @@ class HeraldedDetectorErrorModel:
     def heralded_dems(
         self,
     ) -> frozendict[RefDetector, RefDetectorErrorModel]:
+        """Per-herald sub-DEMs.
+
+        Implementation: build ONE unified stim.Circuit where every heralded
+        error instruction is replaced with one (single-target, tagged) noise
+        instruction per herald, and all non-heralded noise channels and
+        herald detectors are stripped. Compile DEM once; bucket the
+        resulting `error[...]` instructions by their `tag`, which stim
+        propagates from the circuit to the DEM. This avoids re-walking
+        the (large) python RefCircuit and re-emitting the stim circuit
+        per-herald, which used to dominate compile time.
         """
-        Build per-herald DEMs via Pauli propagation, avoiding any DEM extraction.
-
-        Conditional on a herald firing, the error is a fixed Pauli mixture:
-          - HERALDED_ERASE: each of {I, X, Y, Z} occurs with probability 1/4.
-          - HERALDED_PAULI_CHANNEL_1(pI, pX, pY, pZ): Pauli P occurs with
-            probability pP / (pI + pX + pY + pZ).
-
-        So the per-herald hyperedges are fully determined by which detectors
-        (and observables) each Pauli {X, Y, Z} flips when injected at the
-        herald's position.  We compute the X- and Z-flip sets via one
-        deterministic `compile_detector_sampler().sample(1)` each, then derive
-        Y = X XOR Z (Y = iXZ propagates both Pauli frames).  Total DEM calls: 0.
-        """
-        herald_to_noise: dict[RefInstruction, RefInstruction] = {}
-        for instruction in self.heralded_instructions:
-            noise = heralded_instruction_to_noise_instruction(instruction)
-            if noise is not None:
-                herald_to_noise[instruction] = noise
-
-        if not herald_to_noise:
-            return frozendict({})
-
-        # Map each herald's original-circuit index -> skeleton-circuit index.
-        # The skeleton removes heralded DETECTOR instructions, shifting indices.
-        deleted_orig_indices = frozenset(
-            self.ref_circuit.instruction_to_index[det]
-            for det in self.heralded_detectors
-            if det is not None
-        )
-        herald_to_skel_idx: dict[RefInstruction, int] = {}
-        for herald in herald_to_noise:
-            orig_idx = self.ref_circuit.instruction_to_index[herald]
-            skel_idx = orig_idx - sum(
-                1 for d in deleted_orig_indices if d < orig_idx
-            )
-            herald_to_skel_idx[herald] = skel_idx
-
-        # Skeleton detector id -> original detector id.
-        heralded_ids = set(self.heralded_detector_indices)
-        skeleton_to_original: list[int] = [
-            i for i in range(len(self.ref_circuit.detectors)) if i not in heralded_ids
-        ]
-
-        skeleton_stim_instrs = self.skeleton_circuit.stim_instructions
-
-        def _propagate(
-            skel_idx: int, qubit: int, pauli_name: str
-        ) -> tuple[frozenset[int], frozenset[int]]:
-            """Deterministically inject ``pauli_name``(1.0) on ``qubit`` at
-            ``skel_idx`` in a noise-free copy of the skeleton circuit and
-            return (detectors_fired_skeleton_ids, observables_fired)."""
-            probe = stim.Circuit()
-            for i, instr in enumerate(skeleton_stim_instrs):
-                if i == skel_idx:
-                    probe.append(pauli_name, [qubit], [1.0])
-                elif instr.name in _NOISE_INSTRUCTION_NAMES:
-                    continue
-                else:
-                    probe.append(instr)
-            d, o = probe.compile_detector_sampler().sample(
-                1, separate_observables=True
-            )
-            dets = frozenset(i for i, v in enumerate(d[0]) if v)
-            obs = frozenset(i for i, v in enumerate(o[0]) if v) if o.shape[1] else frozenset()
-            return dets, obs
-
-        ref_dems: dict[RefDetector, RefDetectorErrorModel] = {}
-        for detector in self.heralded_detectors:
-            if detector is None:
-                continue
+        # Build a map: heralded_instruction -> [(detector_id, ref_rec.bias), ...]
+        # Each (detector_id, bias) becomes one tagged noise instruction.
+        hi_to_heralds: dict[RefInstruction, list[tuple[int, int]]] = {}
+        herald_detector_set = set()
+        for detector_id in self.heralded_detector_indices:
+            detector = self.heralded_detectors[detector_id]
+            assert detector is not None
+            herald_detector_set.add(detector)
             ref_rec = detector.targets[0]
             assert isinstance(ref_rec, RefRec)
-            herald = ref_rec.instruction
-            if herald not in herald_to_noise:
+            hi_to_heralds.setdefault(ref_rec.instruction, []).append(
+                (detector_id, ref_rec.bias)
+            )
+
+        # Build the unified instruction list:
+        #   - heralded_instruction with at least one valid noise version is
+        #     replaced by N tagged single-target noise instructions
+        #   - other noise channels are removed
+        #   - herald detectors are removed
+        #   - everything else is preserved verbatim (same RefInstruction objects)
+        unified_instructions: list[RefInstruction] = []
+        for instruction in self.ref_circuit:
+            if instruction in herald_detector_set:
                 continue
-
-            target = herald.targets[ref_rec.bias]
-            assert isinstance(target, stim.GateTarget)
-            qubit = target.qubit_value
-            if qubit is None:
-                continue
-
-            skel_idx = herald_to_skel_idx[herald]
-            x_dets_skel, x_obs = _propagate(skel_idx, qubit, "X_ERROR")
-            z_dets_skel, z_obs = _propagate(skel_idx, qubit, "Z_ERROR")
-            y_dets_skel = x_dets_skel ^ z_dets_skel
-            y_obs = x_obs ^ z_obs
-
-            def _to_orig(dets: frozenset[int]) -> frozenset[int]:
-                return frozenset(skeleton_to_original[d] for d in dets)
-
-            x_dets = _to_orig(x_dets_skel)
-            y_dets = _to_orig(y_dets_skel)
-            z_dets = _to_orig(z_dets_skel)
-
-            if herald.name == "HERALDED_ERASE":
-                p_x = p_y = p_z = 0.25
-            elif herald.name == "HERALDED_PAULI_CHANNEL_1":
-                pI, pX, pY, pZ = herald.gate_args
-                p_sum = pI + pX + pY + pZ
-                p_x = pX / p_sum
-                p_y = pY / p_sum
-                p_z = pZ / p_sum
-            else:  # pragma: no cover — guarded by heralded_instruction_to_noise_instruction
-                continue
-
-            # Combine (dets, obs) duplicates and drop the identity contribution.
-            edges: dict[tuple[frozenset[int], frozenset[int]], float] = {}
-            for dets, obs, prob in (
-                (x_dets, x_obs, p_x),
-                (y_dets, y_obs, p_y),
-                (z_dets, z_obs, p_z),
-            ):
-                if prob == 0 or (not dets and not obs):
+            if instruction in hi_to_heralds:
+                all_noise = heralded_instruction_to_noise_instruction(instruction)
+                if all_noise is None:
+                    # heralded with zero true error probability -> drop entirely
                     continue
-                key = (dets, obs)
-                edges[key] = edges.get(key, 0.0) + prob
-
-            if not edges:
-                continue
-
-            dem_instructions: list[RefDemInstruction] = []
-            for (dets, obs), prob in sorted(
-                edges.items(), key=lambda kv: (sorted(kv[0][0]), sorted(kv[0][1]))
-            ):
-                targets: list = [
-                    self.ref_circuit.detectors[d] for d in sorted(dets)
-                ]
-                for obs_id in sorted(obs):
-                    targets.append(stim.DemTarget.logical_observable_id(obs_id))
-                dem_instructions.append(
-                    RefDemInstruction(
-                        type="error",
-                        args=(prob,),
-                        targets=tuple(targets),
+                for detector_id, bias in hi_to_heralds[instruction]:
+                    unified_instructions.append(
+                        RefInstruction(
+                            name=all_noise.name,
+                            targets=(all_noise.targets[bias],),
+                            gate_args=all_noise.gate_args,
+                            tag=f"{_HERALD_TAG_PREFIX}{detector_id}",
+                        )
                     )
-                )
+                continue
+            if is_noise_channel_instruction(instruction):
+                # strip non-heralded noise (already accounted for in skeleton)
+                continue
+            unified_instructions.append(instruction)
 
+        # If no herald produced any noise instruction, we have nothing to compile.
+        any_herald = any(
+            heralded_instruction_to_noise_instruction(hi) is not None
+            for hi in hi_to_heralds
+        )
+        if not any_herald:
+            return frozendict({})
+
+        # Build the unified RefCircuit (cheap; no sanity check) and compile DEM.
+        with unchecked_ref_circuit():
+            unified_ref = RefCircuit.of(unified_instructions)
+        unified_stim = unified_ref.circuit()
+        unified_dem = unified_stim.detector_error_model(
+            approximate_disjoint_errors=True, flatten_loops=True
+        )
+
+        # The unified circuit's detectors are exactly self.ref_circuit's detectors
+        # minus the herald detectors, in order. So local detector id k maps to
+        # unified_ref.detectors[k] (which is the original RefDetector object).
+        non_herald_detectors = unified_ref.detectors
+
+        # Bucket DEM error instructions by herald detector_id (decoded from tag).
+        # Non-error DEM instructions (detector coords, shift_detectors, etc.) are
+        # not needed by RefDetectorErrorModel.hyperedges, so we don't propagate
+        # them.
+        prefix_len = len(_HERALD_TAG_PREFIX)
+        per_herald_instr_lists: dict[int, list[RefDemInstruction]] = defaultdict(list)
+        for instr in unified_dem.flattened():
+            if instr.type != "error":
+                continue
+            tag = instr.tag
+            if not tag.startswith(_HERALD_TAG_PREFIX):
+                # Should never happen given our circuit construction, but guard
+                # against future refactors that introduce other tagged noise.
+                continue
+            detector_id = int(tag[prefix_len:])
+            ref_targets: list[int | stim.DemTarget | RefDetector] = []
+            for target in instr.targets_copy():
+                if target.is_relative_detector_id():
+                    ref_targets.append(non_herald_detectors[target.val])
+                else:
+                    ref_targets.append(target)
+            per_herald_instr_lists[detector_id].append(
+                RefDemInstruction(
+                    type=instr.type,
+                    args=tuple(instr.args_copy()),
+                    targets=tuple(ref_targets),
+                )
+            )
+
+        # Build per-herald RefDetectorErrorModel objects.
+        ref_dems: dict[RefDetector, RefDetectorErrorModel] = {}
+        skeleton_set = self.skeleton_dem.hyperedges_detectors_set
+        for detector_id, instr_list in per_herald_instr_lists.items():
             heralded_dem = RefDetectorErrorModel(
-                instructions=tuple(dem_instructions),
+                instructions=tuple(instr_list),
                 ref_circuit=self.ref_circuit,
             )
             if not heralded_dem.hyperedges:
                 continue
             for hyperedge in heralded_dem.hyperedges:
-                assert (
-                    hyperedge.detectors in self.skeleton_dem.hyperedges_detectors_set
-                ), (
+                assert hyperedge.detectors in skeleton_set, (
                     "bug: the skeleton graph doesn't have the hyperedge, "
                     + "this might causes issue when constructing decoders"
                 )
-            ref_dems[detector] = heralded_dem
+            ref_dems[self.heralded_detectors[detector_id]] = heralded_dem
 
         return frozendict(ref_dems)
 
@@ -473,26 +435,19 @@ class HeraldedDemPredictor(Predictor):
     num_dets: int
     num_obs: int
 
-    def __post_init__(self) -> None:
-        # Precompute numpy arrays so that syndrome_of can use fast boolean indexing
-        # instead of Python set operations (which are slow in the per-shot hot loop).
-        herald_mask = np.zeros(self.num_dets, dtype=bool)
-        det_to_herald_id = np.zeros(self.num_dets, dtype=np.intp)
-        for det_id, herald_id in self.detector_id_to_herald_id.items():
-            herald_mask[det_id] = True
-            det_to_herald_id[det_id] = herald_id
-        object.__setattr__(self, "_herald_mask", herald_mask)
-        object.__setattr__(self, "_det_to_herald_id", det_to_herald_id)
-
     def syndrome_of(self, dets_bit_packed: np.ndarray) -> mwpf.SyndromePattern:
-        active_dets = np.flatnonzero(
-            np.unpackbits(dets_bit_packed, count=self.num_dets, bitorder="little")
+        detectors: set[int] = set(
+            np.flatnonzero(
+                np.unpackbits(dets_bit_packed, count=self.num_dets, bitorder="little")
+            )
         )
-        # Use precomputed boolean mask to split active detectors into
-        # defect vertices and herald indices — no Python set operations needed.
-        is_herald = self._herald_mask[active_dets]
-        defect_vertices = active_dets[~is_herald].tolist()
-        heralds = self._det_to_herald_id[active_dets[is_herald]].tolist()
+        # the heralded detectors are not passed to the decoder
+        defect_vertices = detectors - self.herald_detectors
+        # instead, they are passed as heralds
+        heralds = [
+            self.detector_id_to_herald_id[detector_id]
+            for detector_id in detectors & self.herald_detectors
+        ]
         return mwpf.SyndromePattern(defect_vertices=defect_vertices, heralds=heralds)
 
     def prediction_of(
