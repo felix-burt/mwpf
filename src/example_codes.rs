@@ -1507,6 +1507,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<CodeCapacityTailoredCode>()?;
     m.add_class::<CodeCapacityColorCode>()?;
     m.add_class::<CodeCapacityDepolarizePlanarCode>()?;
+    #[cfg(feature = "qecp_integrate")]
     m.add_class::<QECPlaygroundCode>()?;
     Ok(())
 }
